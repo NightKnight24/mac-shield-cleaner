@@ -29,7 +29,17 @@ A lightweight, native macOS SwiftUI utility combining a **Low-Latency Gaming & S
 
 ---
 
-## Build & Install
+## Install
+
+### Option 1: Download Prebuilt Release (`.dmg` or `.zip`)
+1. Download the latest **`.dmg`** or **`.zip`** from the [Releases](https://github.com/NightKnight24/mac-shield-cleaner/releases) page (Universal Binary for Apple Silicon & Intel, macOS 13+).
+2. Move **`Mac Shield & Cleaner.app`** into `/Applications`.
+3. On first launch (since open-source ad-hoc builds are not Apple-notarized), right-click the app → **Open**, or run:
+   ```bash
+   xattr -cr "/Applications/Mac Shield & Cleaner.app"
+   ```
+
+### Option 2: Build from Source
 
 Requires **macOS 13+** and **Xcode Command Line Tools** (`xcode-select --install`).
 
