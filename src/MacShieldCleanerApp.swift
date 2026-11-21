@@ -119,6 +119,7 @@ final class ShieldViewModel: ObservableObject {
     private let logFile = "/tmp/mac_shield_live.log"
     private let pidFile = "/tmp/mac_shield_engine.pid"
     private var pollTimer: Timer?
+    private var shieldStartedAt: Date?
 
     var onStatusChange: ((Bool, String) -> Void)?
     var onTelemetryUpdate: ((ShieldTelemetry) -> Void)?
@@ -127,12 +128,18 @@ final class ShieldViewModel: ObservableObject {
         checkExistingEngine()
     }
 
+    private func isProcessAlive(_ pid: Int32) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
     func checkExistingEngine() {
         if FileManager.default.fileExists(atPath: pidFile),
            let pidStr = try? String(contentsOfFile: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            let pid = Int32(pidStr),
-           kill(pid, 0) == 0 {
+           isProcessAlive(pid) {
             isActive = true
+            shieldStartedAt = Date()
             startPolling()
         }
     }
@@ -191,6 +198,7 @@ final class ShieldViewModel: ObservableObject {
                     guard let self = self else { return }
                     self.isTransitioning = false
                     if status == 0 {
+                        self.shieldStartedAt = Date()
                         self.isActive = true
                         self.startPolling()
                         self.onStatusChange?(true, mode)
@@ -223,6 +231,7 @@ final class ShieldViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.pollTimer?.invalidate()
                 self.pollTimer = nil
+                self.shieldStartedAt = nil
                 self.isActive = false
                 self.isTransitioning = false
                 self.readLogs()
@@ -258,11 +267,28 @@ final class ShieldViewModel: ObservableObject {
             telemetry = decoded
             if decoded.restored == true && !decoded.active {
                 isActive = false
+                shieldStartedAt = nil
                 pollTimer?.invalidate()
                 pollTimer = nil
                 onStatusChange?(false, selectedMode)
             } else if decoded.active {
                 onTelemetryUpdate?(decoded)
+            }
+        } else if isActive, let startedAt = shieldStartedAt, Date().timeIntervalSince(startedAt) > 12 {
+            let pidAlive: Bool
+            if let pidStr = try? String(contentsOfFile: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let pid = Int32(pidStr) {
+                pidAlive = isProcessAlive(pid)
+            } else {
+                pidAlive = false
+            }
+            if !pidAlive {
+                isActive = false
+                shieldStartedAt = nil
+                pollTimer?.invalidate()
+                pollTimer = nil
+                errorMessage = "Shield engine stopped unexpectedly (see /tmp/mac_shield_boot.log)"
+                onStatusChange?(false, selectedMode)
             }
         }
         readLogs()
@@ -367,9 +393,14 @@ final class CleanerViewModel: ObservableObject {
 
     func quitOpenApps() {
         let running = NSWorkspace.shared.runningApplications
-        let targets = Set(openApps.map { $0.lowercased() })
+        var targets = Set(openApps.map { $0.lowercased() })
+        if targets.contains("steam_osx") {
+            targets.insert("steam")
+        }
         for app in running {
-            if let name = app.localizedName?.lowercased(), targets.contains(where: { name.contains($0) || $0.contains(name) }) {
+            let locName = app.localizedName?.lowercased() ?? ""
+            let execName = app.executableURL?.deletingPathExtension().lastPathComponent.lowercased() ?? ""
+            if (!locName.isEmpty && targets.contains(locName)) || (!execName.isEmpty && targets.contains(execName)) {
                 app.terminate()
             }
         }
@@ -520,7 +551,8 @@ final class ExternalDrivesViewModel: ObservableObject {
 
     @Published var categories: [CleanCategory] = [
         CleanCategory(id: "ext_trashes", title: "Drive Trash (.Trashes)", subtitle: "Deleted files still occupying space on this external drive", icon: "trash.fill", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
-        CleanCategory(id: "ext_temp", title: "Temp & Installer Leftovers (.TemporaryItems, Temp)", subtitle: "Interrupted copies, .tmp files & leftover installer logs", icon: "clock.arrow.circlepath", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
+        CleanCategory(id: "ext_temp", title: "Temporary Items (.TemporaryItems)", subtitle: "Interrupted copies & macOS safe temp items on this drive", icon: "clock.arrow.circlepath", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
+        CleanCategory(id: "ext_root_temp", title: "Root Temp Folder (Temp/)", subtitle: "Top-level Temp folder on drive root (review before enabling)", icon: "folder.badge.minus", badge: "Opt-In", requiresAdmin: false, kb: 0, isSelected: false),
         CleanCategory(id: "ext_steam_cache", title: "External Steam Download & Depot Cache", subtitle: "SteamLibrary downloading/temp/depotcache (never touches installed games)", icon: "gamecontroller.fill", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
         CleanCategory(id: "ext_appledouble", title: "macOS ._* AppleDouble & .DS_Store Clutter", subtitle: "Removes 128KB-cluster ExFAT sidecar files & .DS_Store safely", icon: "doc.on.doc.fill", badge: "ExFAT Boost", requiresAdmin: false, kb: 0, isSelected: true),
         CleanCategory(id: "ext_spotlight", title: "Spotlight & FSEvents Logs (.Spotlight-V100)", subtitle: "Clears external Spotlight index cache on this drive", icon: "magnifyingglass", badge: "Optional", requiresAdmin: false, kb: 0, isSelected: false)
@@ -1434,75 +1466,76 @@ struct ExternalDrivesTabView: View {
                     .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.cardBorder, lineWidth: 1))
                     .cornerRadius(12)
                 } else {
-                    HStack(spacing: 12) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 12)], spacing: 12) {
                         ForEach(vm.drives) { drive in
                             let isSel = vm.selectedDrive?.mountPath == drive.mountPath
                             let ratio = drive.totalKB > 0 ? min(max(Double(drive.usedKB) / Double(drive.totalKB), 0), 1) : 0
-                            Button(action: { vm.scanDrive(drive.mountPath) }) {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack {
-                                        Image(systemName: "externaldrive.fill")
-                                            .font(.system(size: 16, weight: .bold))
-                                            .foregroundColor(isSel ? Theme.accentCyan : .white.opacity(0.6))
-                                        Text(drive.name)
-                                            .font(.system(size: 13.5, weight: .bold))
-                                            .foregroundColor(.white)
-                                        Text(drive.formatName)
-                                            .font(.system(size: 9.5, weight: .bold))
-                                            .foregroundColor(.white.opacity(0.75))
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.white.opacity(0.12))
-                                            .cornerRadius(4)
-                                        Spacer()
-                                        if isSel {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .foregroundColor(Theme.accentCyan)
-                                        }
-                                    }
-
-                                    Text(drive.mountPath)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundColor(.white.opacity(0.45))
-
-                                    GeometryReader { geo in
-                                        ZStack(alignment: .leading) {
-                                            RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.1))
-                                            RoundedRectangle(cornerRadius: 4)
-                                                .fill(LinearGradient(colors: [Theme.accentCyan, Theme.accentBlue], startPoint: .leading, endPoint: .trailing))
-                                                .frame(width: geo.size.width * ratio)
-                                        }
-                                    }
-                                    .frame(height: 7)
-
-                                    HStack {
-                                        Text("\(formatKB(drive.freeKB)) Free of \(formatKB(drive.totalKB))")
-                                            .font(.system(size: 10.5))
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Image(systemName: "externaldrive.fill")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundColor(isSel ? Theme.accentCyan : .white.opacity(0.6))
+                                    Text(drive.name)
+                                        .font(.system(size: 13.5, weight: .bold))
+                                        .foregroundColor(.white)
+                                    Text(drive.formatName)
+                                        .font(.system(size: 9.5, weight: .bold))
+                                        .foregroundColor(.white.opacity(0.75))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.white.opacity(0.12))
+                                        .cornerRadius(4)
+                                    Spacer()
+                                    if isSel {
+                                        Image(systemName: "checkmark.circle.fill")
                                             .foregroundColor(Theme.accentCyan)
-                                        Spacer()
-                                        Button("Finder") { vm.openInFinder(drive.mountPath) }
-                                            .font(.system(size: 10, weight: .semibold))
-                                            .padding(.horizontal, 7).padding(.vertical, 3)
-                                            .background(Color.white.opacity(0.08))
-                                            .foregroundColor(.white.opacity(0.85))
-                                            .cornerRadius(4)
-                                            .buttonStyle(.plain)
-                                        Button("Eject") { vm.ejectDrive(drive.mountPath) }
-                                            .font(.system(size: 10, weight: .semibold))
-                                            .padding(.horizontal, 7).padding(.vertical, 3)
-                                            .background(Color.orange.opacity(0.15))
-                                            .foregroundColor(.orange)
-                                            .cornerRadius(4)
-                                            .buttonStyle(.plain)
                                     }
                                 }
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(isSel ? Theme.accentCyan.opacity(0.10) : Theme.card)
-                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(isSel ? Theme.accentCyan.opacity(0.7) : Theme.cardBorder, lineWidth: isSel ? 1.5 : 1))
-                                .cornerRadius(12)
+
+                                Text(drive.mountPath)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.45))
+
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.1))
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .fill(LinearGradient(colors: [Theme.accentCyan, Theme.accentBlue], startPoint: .leading, endPoint: .trailing))
+                                            .frame(width: geo.size.width * ratio)
+                                    }
+                                }
+                                .frame(height: 7)
+
+                                HStack {
+                                    Text("\(formatKB(drive.freeKB)) Free of \(formatKB(drive.totalKB))")
+                                        .font(.system(size: 10.5))
+                                        .foregroundColor(Theme.accentCyan)
+                                    Spacer()
+                                    Button("Finder") { vm.openInFinder(drive.mountPath) }
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .padding(.horizontal, 7).padding(.vertical, 3)
+                                        .background(Color.white.opacity(0.08))
+                                        .foregroundColor(.white.opacity(0.85))
+                                        .cornerRadius(4)
+                                        .buttonStyle(.plain)
+                                    Button("Eject") { vm.ejectDrive(drive.mountPath) }
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .padding(.horizontal, 7).padding(.vertical, 3)
+                                        .background(Color.orange.opacity(0.15))
+                                        .foregroundColor(.orange)
+                                        .cornerRadius(4)
+                                        .buttonStyle(.plain)
+                                }
                             }
-                            .buttonStyle(.plain)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(isSel ? Theme.accentCyan.opacity(0.10) : Theme.card)
+                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(isSel ? Theme.accentCyan.opacity(0.7) : Theme.cardBorder, lineWidth: isSel ? 1.5 : 1))
+                            .cornerRadius(12)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                vm.scanDrive(drive.mountPath)
+                            }
                         }
                     }
 
@@ -1647,8 +1680,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.updateStatusItem(active: self.shieldVM.isActive, mode: self.shieldVM.selectedMode, telemetry: telem)
         }
 
+        setupMainMenu()
         setupMenuBar()
         openMainWindow()
+    }
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Quit Mac Shield & Cleaner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        windowMenu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        windowMenuItem.submenu = windowMenu
+
+        NSApp.mainMenu = mainMenu
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

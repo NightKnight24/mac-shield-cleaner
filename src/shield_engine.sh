@@ -32,7 +32,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-rm -f "$STOP_FILE"
+rm -f "$STOP_FILE" "$TELEM_FILE" "${TELEM_FILE}.tmp"
 echo "$$" > /tmp/mac_shield_engine.pid
 chmod 644 /tmp/mac_shield_engine.pid 2>/dev/null
 
@@ -190,6 +190,7 @@ export ROUTER_IP_ENV="$ROUTER_IP"
 export APP_PID_ENV="$APP_PID"
 export STOP_FILE_ENV="$STOP_FILE"
 export TELEM_FILE_ENV="$TELEM_FILE"
+export TARGET_USER_ENV="$TARGET_USER"
 
 /usr/bin/python3 - <<'EOF'
 import os, time, subprocess, json
@@ -202,6 +203,14 @@ router_ip = os.environ.get("ROUTER_IP_ENV", "")
 app_pid = os.environ.get("APP_PID_ENV", "")
 stop_file = os.environ.get("STOP_FILE_ENV", "/tmp/mac_shield_stop")
 telem_file = os.environ.get("TELEM_FILE_ENV", "/tmp/mac_shield_telemetry.json")
+target_user = os.environ.get("TARGET_USER_ENV", "")
+
+def run_user_osascript(script, timeout=0.4):
+    if os.geteuid() == 0 and target_user:
+        cmd = ['sudo', '-n', '-u', target_user, 'osascript', '-e', script]
+    else:
+        cmd = ['osascript', '-e', script]
+    return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=timeout).decode().strip()
 
 def norm_mac(m):
     try:
@@ -317,18 +326,20 @@ def scan_and_boost_targets():
     if shield_mode == "gaming":
         try:
             script = 'tell application "System Events" to get unix id of (first application process whose frontmost is true)'
-            front_pid = subprocess.check_output(['osascript', '-e', script], stderr=subprocess.DEVNULL, timeout=0.3).decode().strip()
+            front_pid = run_user_osascript(script, timeout=0.3)
             front_name = subprocess.check_output(['ps', '-p', front_pid, '-o', 'comm='], stderr=subprocess.DEVNULL).decode().strip()
             bname = os.path.basename(front_name)
-            if bname and bname not in ['MacShieldCleaner', 'Finder', 'Terminal', 'loginwindow'] and front_pid not in boosted_pids:
+            if bname and bname not in ['MacShieldCleaner', 'Finder', 'Terminal', 'loginwindow']:
                 # Only auto-boost if it's inside /Applications or Steam/Games
                 if '/Applications/' in front_name or 'steamapps' in front_name.lower() or '/Volumes/' in front_name:
-                    subprocess.call(['renice', '-20', '-p', front_pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.call(['taskpolicy', '-B', '-t', '0', '-p', front_pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    boosted_pids.add(front_pid)
+                    if front_pid not in boosted_pids:
+                        subprocess.call(['renice', '-20', '-p', front_pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.call(['taskpolicy', '-B', '-t', '0', '-p', front_pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        boosted_pids.add(front_pid)
                     label = bname.replace('.app', '')
-                    seen.add(label)
-                    active_labels.append(label)
+                    if label not in seen:
+                        seen.add(label)
+                        active_labels.append(label)
         except:
             pass
 
@@ -347,7 +358,7 @@ def scan_and_boost_targets():
                 if name in ['Google Chrome', 'Safari', 'Brave Browser', 'Firefox', 'Arc']:
                     try:
                         script = 'tell application "System Events" to get name of front window of (first application process whose frontmost is true)'
-                        win_title = subprocess.check_output(['osascript', '-e', script], stderr=subprocess.DEVNULL, timeout=0.4).decode().strip()
+                        win_title = run_user_osascript(script, timeout=0.4)
                         matched_site = next((s for s in STREAMING_SITES if s.lower() in win_title.lower()), None)
                         if not matched_site: continue
                         name = f"{matched_site} ({name})"
@@ -422,8 +433,13 @@ while True:
     if app_pid and not is_pid_alive(app_pid):
         break
 
-    time.sleep(1.0)
-    if os.path.exists(stop_file) or (app_pid and not is_pid_alive(app_pid)):
+    should_exit = False
+    for _ in range(4):
+        if os.path.exists(stop_file) or (app_pid and not is_pid_alive(app_pid)):
+            should_exit = True
+            break
+        time.sleep(0.25)
+    if should_exit:
         break
 
     now_t = time.time()

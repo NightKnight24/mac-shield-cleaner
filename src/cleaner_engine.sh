@@ -20,8 +20,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/go/bin:$PATH"
+NVM_LATEST=$(ls -1d "$HOME/.nvm/versions/node"/*/bin 2>/dev/null | sort -V | tail -n 1)
+[ -n "$NVM_LATEST" ] && export PATH="$NVM_LATEST:$PATH"
+
 USER_C_DIR="$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null)"; USER_C_DIR="${USER_C_DIR%/}"
 USER_T_DIR="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)";  USER_T_DIR="${USER_T_DIR%/}"
+TDIR="${USER_T_DIR:-${TMPDIR%/}}"
+TDIR="${TDIR%/}"
 USER_X_DIR=""
 if [ -n "$USER_C_DIR" ]; then
     USER_X_DIR="$(dirname "$USER_C_DIR")/X"
@@ -116,7 +122,13 @@ purge_dir() {
 purge_path() {
     local p="$1"
     [ -e "$p" ] || [ -L "$p" ] || return 0
-    case "$p" in "$HOME"/*|"$USER_C_DIR"/*|"$USER_X_DIR"/*|/private/tmp/*) ;; *) return 0 ;; esac
+    local allowed=0
+    case "$p" in "$HOME"/*|/private/tmp/*) allowed=1 ;; esac
+    [ -n "$USER_C_DIR" ] && case "$p" in "$USER_C_DIR"/*) allowed=1 ;; esac
+    [ -n "$USER_T_DIR" ] && case "$p" in "$USER_T_DIR"/*) allowed=1 ;; esac
+    [ -n "$TDIR" ] && case "$p" in "$TDIR"/*) allowed=1 ;; esac
+    [ -n "$USER_X_DIR" ] && case "$p" in "$USER_X_DIR"/*) allowed=1 ;; esac
+    [ "$allowed" -eq 1 ] || return 0
     local kb=0
     [ -L "$p" ] || kb=$(dir_kb "$p")
     rm -rf "$p" 2>/dev/null && CLEANED_KB=$((CLEANED_KB + kb))
@@ -137,7 +149,11 @@ BROWSER_ROOTS=(
 # ------------------------------------------------------------------------------
 if [ "$MODE" = "scan" ]; then
     refresh_running
+    kb_brew_cache=0
+    [ -d "$HOME/Library/Caches/Homebrew" ] && kb_brew_cache=$(dir_kb "$HOME/Library/Caches/Homebrew")
     kb_app_caches=$(dir_kb "$HOME/Library/Caches")
+    kb_app_caches=$((kb_app_caches - kb_brew_cache))
+    [ "$kb_app_caches" -lt 0 ] && kb_app_caches=0
     kb_cont_caches=0
     for c in "$HOME/Library/Containers"/*/Data/Library/Caches "$HOME/Library/Group Containers"/*/Library/Caches; do
         [ -d "$c" ] && [ ! -L "$c" ] && kb_cont_caches=$((kb_cont_caches + $(dir_kb "$c")))
@@ -159,9 +175,59 @@ if [ "$MODE" = "scan" ]; then
         done
     done
 
-    kb_user_sys=$(( $(dir_kb "$USER_C_DIR") + $(dir_kb "$USER_T_DIR") ))
-    kb_dev=$(( $(dir_kb "$HOME/.cache") + $(dir_kb "$HOME/.npm/_cacache") + $(dir_kb "$HOME/Library/Developer/Xcode/DerivedData") + $(dir_kb "$HOME/Library/Developer/CoreSimulator/Caches") ))
-    [ -d "$HOME/Library/Caches/Homebrew" ] && kb_dev=$((kb_dev + $(dir_kb "$HOME/Library/Caches/Homebrew")))
+    kb_desktop_app=0
+    for app in "$AS"/*; do
+        [ -d "$app" ] && [ ! -L "$app" ] || continue
+        base="$(basename "$app")"
+        case "$base" in
+            CrossOver|Google|Chromium|BraveSoftware|"Microsoft Edge"|Vivaldi|Arc|com.operasoftware.*|MobileSync|AddressBook|CallHistoryDB|Knowledge|com.apple.*) continue ;;
+        esac
+        while IFS= read -r d; do
+            case "$d" in */Bottles/*|*/Prefixes/*|*/tools/*|*/drive_c/*) continue ;; esac
+            kb_desktop_app=$((kb_desktop_app + $(dir_kb "$d")))
+        done < <(find "$app" -xdev -maxdepth 4 -type d \( -name "Cache" -o -name "Code Cache" -o -name "GPUCache" \
+                  -o -name "DawnCache" -o -name "DawnGraphiteCache" -o -name "DawnWebGPUCache" -o -name "GrShaderCache" \
+                  -o -name "CachedData" -o -name "CacheStorage" -o -name "ScriptCache" -o -name "htmlcache" \
+                  -o -name "appcache" -o -name "logs" \) -prune 2>/dev/null)
+    done
+
+    kb_bottles=0
+    for p in "$AS/CrossOver/Bottles"/* "$HOME/Games/Heroic/Prefixes"/* "$HOME/Games/Heroic/Prefixes/default"/*; do
+        [ -d "$p/drive_c" ] || continue
+        kb_bottles=$((kb_bottles + $(dir_kb "$p/drive_c/windows/temp")))
+        for u in "$p"/drive_c/users/*; do
+            [ -d "$u" ] || continue
+            kb_bottles=$((kb_bottles + $(dir_kb "$u/AppData/Local/Temp") + $(dir_kb "$u/AppData/Local/CrashDumps") + $(dir_kb "$u/Temp")))
+        done
+        for s in "$p/drive_c/Program Files (x86)/Steam" "$p/drive_c/Program Files/Steam"; do
+            [ -d "$s" ] || continue
+            kb_bottles=$((kb_bottles + $(dir_kb "$s/appcache/httpcache") + $(dir_kb "$s/config/htmlcache") + $(dir_kb "$s/logs") + $(dir_kb "$s/dumps")))
+        done
+    done
+
+    kb_user_sys=0
+    if [ -n "$USER_C_DIR" ] && [ -d "$USER_C_DIR" ]; then
+        for item in "$USER_C_DIR"/*; do
+            [ -e "$item" ] || continue
+            base="$(basename "$item")"
+            is_shader_cache "$base" && continue
+            case "$base" in com.apple.*) continue ;; esac
+            kb_user_sys=$((kb_user_sys + $(dir_kb "$item")))
+        done
+    fi
+    if [ -n "$TDIR" ] && [ -d "$TDIR" ]; then
+        [ -d "$TDIR/stremio-cache" ] && kb_user_sys=$((kb_user_sys + $(dir_kb "$TDIR/stremio-cache")))
+        [ -d "$TDIR/TemporaryItems" ] && kb_user_sys=$((kb_user_sys + $(dir_kb "$TDIR/TemporaryItems")))
+        for ti in "$TDIR"/com.google.*.ShipIt* "$TDIR"/*.dmg; do
+            [ -e "$ti" ] && kb_user_sys=$((kb_user_sys + $(dir_kb "$ti")))
+        done
+        while IFS= read -r old_t; do
+            tbase="$(basename "$old_t")"
+            case "$tbase" in stremio-cache|TemporaryItems|com.google.*.ShipIt*|*.dmg) continue ;; esac
+            kb_user_sys=$((kb_user_sys + $(dir_kb "$old_t")))
+        done < <(find "$TDIR" -xdev -mindepth 1 -maxdepth 1 ! -type s -mtime +1 2>/dev/null)
+    fi
+    kb_dev=$(( $(dir_kb "$HOME/.cache") + $(dir_kb "$HOME/.npm/_cacache") + $(dir_kb "$HOME/Library/Developer/Xcode/DerivedData") + $(dir_kb "$HOME/Library/Developer/CoreSimulator/Caches") + kb_brew_cache ))
     kb_logs=$(dir_kb "$HOME/Library/Logs")
     kb_trash=$(dir_kb "$HOME/.Trash")
 
@@ -234,9 +300,9 @@ data = {
         "app_caches": $kb_app_caches,
         "containers": $kb_cont_caches,
         "browsers": $kb_browsers,
-        "desktop_app_support": 0,
+        "desktop_app_support": $kb_desktop_app,
         "system_user_temp": $kb_user_sys,
-        "bottles": 0,
+        "bottles": $kb_bottles,
         "dev_caches": $kb_dev,
         "logs": $kb_logs,
         "system_data_bloat": $kb_sys_bloat,
@@ -271,18 +337,19 @@ if [ "$MODE" = "ext_scan" ]; then
     uid=$(id -u)
     kb_ext_trash=$(dir_kb "$EXT_VOL/.Trashes/$uid")
     [ "$kb_ext_trash" -eq 0 ] && kb_ext_trash=$(dir_kb "$EXT_VOL/.Trashes")
-    kb_ext_temp=$(( $(dir_kb "$EXT_VOL/.TemporaryItems") + $(dir_kb "$EXT_VOL/Temp") ))
+    kb_ext_temp=$(dir_kb "$EXT_VOL/.TemporaryItems")
+    kb_ext_root_temp=$(dir_kb "$EXT_VOL/Temp")
     kb_ext_steam=$(( $(dir_kb "$EXT_VOL/SteamLibrary/steamapps/downloading") + $(dir_kb "$EXT_VOL/SteamLibrary/steamapps/temp") + $(dir_kb "$EXT_VOL/SteamLibrary/steamapps/depotcache") + $(dir_kb "$EXT_VOL/SteamLibrary/appcache") ))
     kb_ext_spot=$(( $(dir_kb "$EXT_VOL/.Spotlight-V100") + $(dir_kb "$EXT_VOL/.fseventsd") ))
-    dot_count=$(find "$EXT_VOL" -xdev -maxdepth 3 \( -name "._*" -o -name ".DS_Store" \) 2>/dev/null | wc -l | awk '{print $1+0}')
+    dot_count=$(find "$EXT_VOL" -xdev -maxdepth 3 \( -path "$EXT_VOL/.Trashes" -o -path "$EXT_VOL/.Spotlight-V100" -o -path "$EXT_VOL/.fseventsd" \) -prune -o \( -name "._*" -o -name ".DS_Store" \) -type f -print 2>/dev/null | wc -l | awk '{print $1+0}')
     kb_ext_dots=$((dot_count * 128))
     ext_total=$(df -k "$EXT_VOL" | awk 'NR==2 {print $2+0}')
     ext_free=$(df -k "$EXT_VOL" | awk 'NR==2 {print $4+0}')
     ext_used=$((ext_total - ext_free))
-    python3 - <<EOF
-import json
+    EXT_VOL="$EXT_VOL" python3 - <<EOF
+import json, os
 print(json.dumps({
-    "mount": "$EXT_VOL",
+    "mount": os.environ["EXT_VOL"],
     "total_kb": $ext_total,
     "free_kb": $ext_free,
     "used_kb": $ext_used,
@@ -290,6 +357,7 @@ print(json.dumps({
     "categories": {
         "ext_trashes": $kb_ext_trash,
         "ext_temp": $kb_ext_temp,
+        "ext_root_temp": $kb_ext_root_temp,
         "ext_steam_cache": $kb_ext_steam,
         "ext_appledouble": $kb_ext_dots,
         "ext_spotlight": $kb_ext_spot
@@ -321,8 +389,11 @@ if [ "$MODE" = "ext_clean" ]; then
         purge_ext_dir "$EXT_VOL/.Trashes"
     fi
     if has_cat "ext_temp"; then
-        echo "PROGRESS|42|Cleaning Temporary & Installer Files (.TemporaryItems, Temp)..."
+        echo "PROGRESS|42|Cleaning Temporary & Installer Files (.TemporaryItems)..."
         purge_ext_dir "$EXT_VOL/.TemporaryItems"
+    fi
+    if has_cat "ext_root_temp"; then
+        echo "PROGRESS|50|Cleaning External Root Temp/ Folder..."
         purge_ext_dir "$EXT_VOL/Temp"
     fi
     if has_cat "ext_steam_cache"; then
@@ -334,8 +405,7 @@ if [ "$MODE" = "ext_clean" ]; then
     fi
     if has_cat "ext_appledouble"; then
         echo "PROGRESS|78|Removing macOS ._* AppleDouble & .DS_Store Clutter..."
-        cnt=$(find "$EXT_VOL" -xdev \( -name "._*" -o -name ".DS_Store" \) -type f 2>/dev/null | wc -l | awk '{print $1+0}')
-        find "$EXT_VOL" -xdev \( -name "._*" -o -name ".DS_Store" \) -type f -delete 2>/dev/null
+        cnt=$(find "$EXT_VOL" -xdev \( -path "$EXT_VOL/.Trashes" -o -path "$EXT_VOL/.Spotlight-V100" -o -path "$EXT_VOL/.fseventsd" \) -prune -o \( -name "._*" -o -name ".DS_Store" \) -type f -print -exec rm -f {} + 2>/dev/null | wc -l | awk '{print $1+0}')
         EXT_CLEANED=$((EXT_CLEANED + cnt * 8))
     fi
     if has_cat "ext_spotlight"; then
@@ -445,8 +515,23 @@ if has_cat "system_user_temp"; then
             if [ -d "$item" ]; then purge_dir "$item"; else purge_path "$item"; fi
         done
     fi
-    rm -rf "$TMPDIR"/com.google.*.ShipIt* "$TMPDIR"/*.dmg "$TMPDIR"/TemporaryItems/* 2>/dev/null
-    find "$TMPDIR" -xdev -mindepth 1 -maxdepth 2 ! -type s -mtime +1 -exec rm -rf {} + 2>/dev/null
+    if [ -n "$TDIR" ] && [ -d "$TDIR" ]; then
+        if [ -d "$TDIR/stremio-cache" ]; then
+            if is_running "stremio"; then
+                note_skip "Stremio"
+            else
+                purge_dir "$TDIR/stremio-cache"
+            fi
+        fi
+        for ti in "$TDIR"/com.google.*.ShipIt* "$TDIR"/*.dmg; do
+            [ -e "$ti" ] && purge_path "$ti"
+        done
+        purge_dir "$TDIR/TemporaryItems"
+        while IFS= read -r old_t; do
+            [ "$(basename "$old_t")" = "stremio-cache" ] && continue
+            purge_path "$old_t"
+        done < <(find "$TDIR" -xdev -mindepth 1 -maxdepth 1 ! -type s -mtime +1 2>/dev/null)
+    fi
     find /private/tmp -xdev -user "$(whoami)" -mindepth 1 ! -type s -mtime +1 -exec rm -rf {} + 2>/dev/null
 fi
 
