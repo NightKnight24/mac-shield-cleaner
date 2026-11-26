@@ -9,8 +9,8 @@ A lightweight, native macOS SwiftUI utility combining a **Low-Latency Gaming & S
 ### 1. Anti-Lag Shield
 * **Gaming Mode:** Disables delayed TCP ACKs (`delayed_ack=0`), tunes tight 4 MB anti-bufferbloat buffers, enables QoS fast-path, prioritizes active games/emulators/launchers (`renice -20` & `taskpolicy`), and enables macOS Game Mode support.
 * **Streaming & Media Mode:** Enables Gigabit TSO and large 32 MB dynamic TCP buffers for 4K streaming apps (`Stremio`, `Plex`, `IINA`, `VLC`) and streaming browser tabs.
-* **Zero-Stutter System Guard:** Pauses Spotlight indexing (`mdutil -i off /`), pauses AWDL/AirDrop background scans (`awdl0`/`llw0`), flushes DNS cache, prevents sleep (`caffeinate -dimsu`), and auto-learns your router's real MAC address to lock your default gateway ARP entry.
-* **Live Menu Bar & Auto-Restore:** Shows live ping and active mode right in your macOS Menu Bar. Automatically restores all `sysctl`, AWDL, and Spotlight defaults when you stop the Shield or quit the app.
+* **Zero-Stutter System Guard:** Pauses Spotlight indexing (`mdutil -i off /`), pauses AWDL/AirDrop background scans (`awdl0`/`llw0`), flushes DNS cache, prevents sleep (`caffeinate -dimsu`), and auto-learns your router's real MAC address to lock your default gateway ARP entry (with automatic re-learning when switching networks).
+* **Live Telemetry, Launch at Login & Auto-Restore:** Tracks live ping + rolling jitter/min/avg right in the UI and macOS Menu Bar, supports Launch at Login (`SMAppService`), remembers your settings across launches, includes an in-app GitHub update check, and snapshots your exact `sysctl` values on start so stopping the Shield or quitting the app restores your Mac's original defaults cleanly.
 
 ### 2. System Data & Cache Cleaner
 * Cleans discardable caches without deleting cookies, logins, bookmarks, game saves, or projects:
@@ -25,7 +25,7 @@ A lightweight, native macOS SwiftUI utility combining a **Low-Latency Gaming & S
 
 ### 3. External Drives Cleaner
 * Automatically detects mounted writable external HDDs, SSDs, and USB drives in real time.
-* Safely cleans `.Trashes`, `.TemporaryItems`, leftover `Temp/` installer files, external `SteamLibrary` download/depot caches, and macOS `._*` AppleDouble / `.DS_Store` clutter (especially impactful on ExFAT drives) without ever touching user files, games, or archives.
+* Safely cleans `.Trashes`, `.TemporaryItems`, external `SteamLibrary` download/depot caches, and macOS `._*` AppleDouble / `.DS_Store` clutter (especially impactful on ExFAT drives) without ever touching user files, games, or archives. Top-level `Temp/` cleanup is an explicit opt-in toggle with confirmation.
 
 ---
 

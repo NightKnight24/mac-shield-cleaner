@@ -438,6 +438,7 @@ if has_cat "app_caches"; then
         for item in "$HOME/Library/Caches"/* "$HOME/Library/Caches"/.[!.]*; do
             [ -e "$item" ] || continue
             base="$(basename "$item")"
+            [ "$base" = "Homebrew" ] && continue
             if is_running "$base"; then note_skip "$base"; continue; fi
             if [ $CLEAR_SHADERS -eq 0 ] && is_shader_cache "$base"; then continue; fi
             if [ -d "$item" ] && [ ! -L "$item" ]; then purge_dir "$item"; else purge_path "$item"; fi

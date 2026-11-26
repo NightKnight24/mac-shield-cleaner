@@ -29,12 +29,12 @@ echo "[2/4] Compiling Universal Binary (arm64 + x86_64)..."
 swiftc -O -parse-as-library -target arm64-apple-macosx13.0 \
     "$ROOT_DIR/src/MacShieldCleanerApp.swift" \
     -o "$BUILD_DIR/MacShieldCleaner-arm64" \
-    -framework SwiftUI -framework AppKit
+    -framework SwiftUI -framework AppKit -framework ServiceManagement
 
 swiftc -O -parse-as-library -target x86_64-apple-macosx13.0 \
     "$ROOT_DIR/src/MacShieldCleanerApp.swift" \
     -o "$BUILD_DIR/MacShieldCleaner-x86_64" \
-    -framework SwiftUI -framework AppKit
+    -framework SwiftUI -framework AppKit -framework ServiceManagement
 
 lipo -create -output "$APP_DIR/Contents/MacOS/MacShieldCleaner" \
     "$BUILD_DIR/MacShieldCleaner-arm64" "$BUILD_DIR/MacShieldCleaner-x86_64"
@@ -67,9 +67,9 @@ cat << 'PLIST' > "$APP_DIR/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.1</string>
+    <string>1.1.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>

@@ -45,6 +45,19 @@ log_msg() {
 : > "$LOG_FILE"
 chmod 644 "$LOG_FILE" 2>/dev/null
 
+is_valid_mac() {
+    [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+if [ -n "$CUSTOM_GW_MAC" ] && ! is_valid_mac "$CUSTOM_GW_MAC"; then
+    log_msg "[!] Ignoring invalid gateway MAC format"
+    CUSTOM_GW_MAC=""
+fi
+if [ -n "$WATCH_SPOOF_MAC" ] && ! is_valid_mac "$WATCH_SPOOF_MAC"; then
+    log_msg "[!] Ignoring invalid spoof-watch MAC format"
+    WATCH_SPOOF_MAC=""
+fi
+
 if [[ "$SHIELD_MODE" == "streaming" ]]; then
     MODE_TITLE="STREAMING & MEDIA SERVER MODE"
 else
@@ -76,6 +89,30 @@ elif [ -n "$ROUTER_IP" ]; then
         ""|"(incomplete)"|"ff:ff:ff:ff:ff:ff") LEARNED_GW_MAC="" ;;
     esac
 fi
+
+# Snapshot current sysctl defaults before applying Shield overrides (bash 3.2 indexed arrays)
+SYSCTL_KEYS=(
+    net.qos.policy.wifi_enabled
+    net.qos.policy.capable_enabled
+    net.qos.reset_dscp_to_wifi_ac_map
+    net.inet.tcp.tso
+    net.inet.tcp.delayed_ack
+    net.inet.tcp.sendspace
+    net.inet.tcp.recvspace
+    net.inet.tcp.autorcvbufmax
+    net.inet.tcp.autosndbufmax
+    net.inet.udp.recvspace
+    net.inet.udp.maxdgram
+    net.inet.icmp.drop_redirect
+    net.inet.ip.redirect
+    net.inet6.icmp6.rediraccept
+    kern.ipc.somaxconn
+)
+ORIG_SYSCTL_VALS=()
+for key in "${SYSCTL_KEYS[@]}"; do
+    val=$(sysctl -n "$key" 2>/dev/null || echo "")
+    ORIG_SYSCTL_VALS+=("$val")
+done
 
 if [ "$LOCK_ARP" = "1" ] && [ -n "$ROUTER_IP" ] && [ -n "$LEARNED_GW_MAC" ]; then
     arp -d "$ROUTER_IP" ifscope "$INTERFACE" >/dev/null 2>&1
@@ -148,19 +185,13 @@ cleanup() {
     trap - SIGHUP SIGINT SIGTERM EXIT
     log_msg "[*] Restoring all original system & network defaults..."
 
-    sysctl -w net.qos.policy.wifi_enabled=0 >/dev/null 2>&1
-    sysctl -w net.qos.policy.capable_enabled=0 >/dev/null 2>&1
-    sysctl -w net.qos.reset_dscp_to_wifi_ac_map=0 >/dev/null 2>&1
-    sysctl -w net.inet.tcp.tso=1 >/dev/null 2>&1
-    sysctl -w net.inet.tcp.delayed_ack=2 >/dev/null 2>&1
-    sysctl -w net.inet.tcp.sendspace=1048576 >/dev/null 2>&1
-    sysctl -w net.inet.tcp.recvspace=1048576 >/dev/null 2>&1
-    sysctl -w net.inet.tcp.autorcvbufmax=4194304 >/dev/null 2>&1
-    sysctl -w net.inet.tcp.autosndbufmax=4194304 >/dev/null 2>&1
-    sysctl -w net.inet.udp.recvspace=786896 >/dev/null 2>&1
-    sysctl -w net.inet.icmp.drop_redirect=0 >/dev/null 2>&1
-    sysctl -w net.inet.ip.redirect=1 >/dev/null 2>&1
-    sysctl -w kern.ipc.somaxconn=128 >/dev/null 2>&1
+    local i=0
+    while [ "$i" -lt "${#SYSCTL_KEYS[@]}" ]; do
+        if [ -n "${ORIG_SYSCTL_VALS[$i]}" ]; then
+            sysctl -w "${SYSCTL_KEYS[$i]}=${ORIG_SYSCTL_VALS[$i]}" >/dev/null 2>&1
+        fi
+        i=$((i + 1))
+    done
 
     mdutil -i on / >/dev/null 2>&1
 
@@ -191,19 +222,48 @@ export APP_PID_ENV="$APP_PID"
 export STOP_FILE_ENV="$STOP_FILE"
 export TELEM_FILE_ENV="$TELEM_FILE"
 export TARGET_USER_ENV="$TARGET_USER"
+export CUSTOM_GW_MAC_ENV="$CUSTOM_GW_MAC"
+export LOG_FILE_ENV="$LOG_FILE"
 
 /usr/bin/python3 - <<'EOF'
-import os, time, subprocess, json
+import os, re, time, subprocess, json
 
 shield_mode = os.environ.get("SHIELD_MODE_ENV", "gaming")
 lock_arp = os.environ.get("LOCK_ARP_ENV", "1") == "1"
 gw_mac = os.environ.get("LEARNED_GW_MAC_ENV", "")
+custom_gw_mac = os.environ.get("CUSTOM_GW_MAC_ENV", "")
 spoof_mac = os.environ.get("WATCH_SPOOF_MAC_ENV", "")
 router_ip = os.environ.get("ROUTER_IP_ENV", "")
 app_pid = os.environ.get("APP_PID_ENV", "")
 stop_file = os.environ.get("STOP_FILE_ENV", "/tmp/mac_shield_stop")
 telem_file = os.environ.get("TELEM_FILE_ENV", "/tmp/mac_shield_telemetry.json")
+log_file = os.environ.get("LOG_FILE_ENV", "/tmp/mac_shield_live.log")
 target_user = os.environ.get("TARGET_USER_ENV", "")
+
+def log_py(msg):
+    try:
+        with open(log_file, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except:
+        pass
+
+def learn_gateway_mac(ip):
+    if not ip:
+        return ""
+    try:
+        subprocess.call(['ping', '-c', '1', '-W', '300', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(['arp', '-n', ip], stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            parts = line.split()
+            if 'at' in parts:
+                idx = parts.index('at')
+                if idx + 1 < len(parts):
+                    cand = parts[idx + 1].strip()
+                    if re.match(r'^([0-9A-Fa-f]{1,2}:){5}[0-9A-Fa-f]{1,2}$', cand) and cand.lower() != 'ff:ff:ff:ff:ff:ff':
+                        return cand
+    except:
+        pass
+    return ""
 
 def run_user_osascript(script, timeout=0.4):
     if os.geteuid() == 0 and target_user:
@@ -343,8 +403,28 @@ def scan_and_boost_targets():
         except:
             pass
 
+    front_app_name, front_win_title = "", ""
+    if shield_mode == "streaming":
+        try:
+            script = 'tell application "System Events" to set p to (first application process whose frontmost is true)\nreturn (name of p) & "|||" & (name of front window of p)'
+            res = run_user_osascript(script, timeout=0.4)
+            if "|||" in res:
+                front_app_name, front_win_title = res.split("|||", 1)
+        except:
+            pass
+
     for name in targets:
         try:
+            display_name = name
+            if name in ['Google Chrome', 'Safari', 'Brave Browser', 'Firefox', 'Arc']:
+                f_low, n_low = front_app_name.lower(), name.lower()
+                if not f_low or (f_low != n_low and not ('firefox' in n_low and 'firefox' in f_low)):
+                    continue
+                matched_site = next((s for s in STREAMING_SITES if s.lower() in front_win_title.lower()), None)
+                if not matched_site:
+                    continue
+                display_name = f"{matched_site} ({name})"
+
             out = subprocess.check_output(['pgrep', '-i', name], stderr=subprocess.DEVNULL).decode().strip().split()
             matched_pids = []
             for p in out:
@@ -355,14 +435,6 @@ def scan_and_boost_targets():
                     continue
                 if name == "node" and '/applications/stremio' not in comm.lower() and 'server.js' not in args.lower():
                     continue
-                if name in ['Google Chrome', 'Safari', 'Brave Browser', 'Firefox', 'Arc']:
-                    try:
-                        script = 'tell application "System Events" to get name of front window of (first application process whose frontmost is true)'
-                        win_title = run_user_osascript(script, timeout=0.4)
-                        matched_site = next((s for s in STREAMING_SITES if s.lower() in win_title.lower()), None)
-                        if not matched_site: continue
-                        name = f"{matched_site} ({name})"
-                    except: continue
                 matched_pids.append((p, bname))
             if matched_pids:
                 for (pid, _) in matched_pids:
@@ -370,7 +442,7 @@ def scan_and_boost_targets():
                         subprocess.call(['renice', '-20', '-p', pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         subprocess.call(['taskpolicy', '-B', '-t', '0', '-p', pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         boosted_pids.add(pid)
-                label = name
+                label = display_name
                 if label not in seen:
                     seen.add(label)
                     active_labels.append(label)
@@ -447,9 +519,24 @@ while True:
 
     if loop_counter % 5 == 0:
         active_iface = get_active_interface()
-        if active_iface != current_iface:
+        new_gw = get_gateway() or gateway_ip
+        if active_iface != current_iface or (new_gw and new_gw != gateway_ip):
+            if lock_arp and gateway_ip:
+                subprocess.call(['arp', '-d', gateway_ip, 'ifscope', current_iface], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.call(['arp', '-d', gateway_ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             current_iface = active_iface
-            gateway_ip = get_gateway()
+            gateway_ip = new_gw
+            router_ip = new_gw
+            if lock_arp and not custom_gw_mac and gateway_ip:
+                gw_mac = learn_gateway_mac(gateway_ip)
+                v_norm = norm_mac(gw_mac) if gw_mac else ""
+                if v_norm:
+                    enforce_arp_guard(current_iface)
+                    log_py(f"[OK] Route changed -> {current_iface} | Gateway: {gateway_ip} ({gw_mac})")
+                else:
+                    log_py(f"[*] Route changed -> {current_iface} | Gateway: {gateway_ip} (ARP Monitoring)")
+            else:
+                log_py(f"[*] Route changed -> {current_iface} | Gateway: {gateway_ip or 'Auto'}")
             prev_ib, prev_ob = get_iface_bytes(current_iface)
             prev_t = now_t
             continue

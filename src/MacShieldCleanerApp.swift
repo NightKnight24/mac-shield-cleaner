@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Foundation
+import ServiceManagement
 
 // MARK: - Data Models
 
@@ -100,17 +101,196 @@ func formatBPS(_ bps: Int) -> String {
     }
 }
 
+// MARK: - Helpers (Streaming & Login Item & Update Checker)
+
+private func runLineStreamingBash(
+    scriptPath: String,
+    arguments: [String],
+    onProgress: @escaping @Sendable (Double, String) -> Void
+) -> (cleanedKB: Int64, beforeKB: Int64, afterKB: Int64, skipped: [String], stderr: String) {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+    proc.arguments = [scriptPath] + arguments
+    let pipe = Pipe()
+    let errPipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = errPipe
+
+    var cleanedKB: Int64 = 0
+    var beforeKB: Int64 = 0
+    var afterKB: Int64 = 0
+    var skipped: [String] = []
+
+    func handleLine(_ s: String) {
+        if s.hasPrefix("PROGRESS|") {
+            let parts = s.split(separator: "|", maxSplits: 2).map(String.init)
+            if parts.count == 3, let pct = Double(parts[1]) {
+                onProgress(pct, parts[2])
+            }
+        } else if s.hasPrefix("RESULT|") {
+            let parts = s.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            if parts.count >= 5 {
+                beforeKB = Int64(parts[1]) ?? beforeKB
+                afterKB = Int64(parts[2]) ?? afterKB
+                cleanedKB += Int64(parts[3]) ?? 0
+                skipped = parts[4].split(separator: "|").map(String.init).filter { !$0.hasPrefix("com.apple.") }
+            }
+        }
+    }
+
+    do {
+        try proc.run()
+        var lineBuffer = Data()
+        let handle = pipe.fileHandleForReading
+        while true {
+            let chunk = handle.availableData
+            if chunk.isEmpty { break }
+            lineBuffer.append(chunk)
+            while let nlIndex = lineBuffer.firstIndex(of: 0x0A) {
+                let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<nlIndex)
+                lineBuffer.removeSubrange(lineBuffer.startIndex...nlIndex)
+                if let s = String(data: lineData, encoding: .utf8) {
+                    handleLine(s)
+                }
+            }
+        }
+        if !lineBuffer.isEmpty, let s = String(data: lineBuffer, encoding: .utf8) {
+            handleLine(s)
+        }
+        proc.waitUntilExit()
+    } catch {
+        return (0, 0, 0, [], error.localizedDescription)
+    }
+
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return (cleanedKB, beforeKB, afterKB, skipped, errStr)
+}
+
+@MainActor
+final class LoginItemManager: ObservableObject {
+    @Published var isEnabled: Bool = false
+    @Published var statusMessage: String?
+
+    init() {
+        refresh()
+    }
+
+    func refresh() {
+        let st = SMAppService.mainApp.status
+        isEnabled = (st == .enabled || st == .requiresApproval)
+        if st == .requiresApproval {
+            statusMessage = "Approve in System Settings → General → Login Items"
+        } else {
+            statusMessage = nil
+        }
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            refresh()
+        } catch {
+            refresh()
+            statusMessage = "Login item requires running from /Applications (\(error.localizedDescription))"
+        }
+    }
+}
+
+private struct GitHubLatestRelease: Codable {
+    let tag_name: String
+    let html_url: String
+}
+
+@MainActor
+final class UpdateChecker: ObservableObject {
+    @Published var isChecking: Bool = false
+    @Published var updateAvailableVersion: String?
+    @Published var releaseURL: URL = URL(string: "https://github.com/NightKnight24/mac-shield-cleaner/releases/latest")!
+    @Published var statusText: String?
+
+    var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.0"
+    }
+
+    private func isNewerVersion(_ remote: String, than local: String) -> Bool {
+        let rParts = remote.trimmingCharacters(in: CharacterSet(charactersIn: "vV")).split(separator: ".").compactMap { Int($0) }
+        let lParts = local.trimmingCharacters(in: CharacterSet(charactersIn: "vV")).split(separator: ".").compactMap { Int($0) }
+        let maxCount = max(rParts.count, lParts.count)
+        for i in 0..<maxCount {
+            let rv = i < rParts.count ? rParts[i] : 0
+            let lv = i < lParts.count ? lParts[i] : 0
+            if rv != lv { return rv > lv }
+        }
+        return false
+    }
+
+    func checkForUpdates(silent: Bool = false) {
+        guard !isChecking else { return }
+        guard let url = URL(string: "https://api.github.com/repos/NightKnight24/mac-shield-cleaner/releases/latest") else { return }
+        isChecking = true
+        if !silent { statusText = "Checking GitHub..." }
+
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("MacShieldCleaner/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isChecking = false
+                if let error = error {
+                    if !silent { self.statusText = "Update check failed: \(error.localizedDescription)" }
+                    return
+                }
+                guard let data = data,
+                      let rel = try? JSONDecoder().decode(GitHubLatestRelease.self, from: data) else {
+                    if !silent { self.statusText = "Could not parse release info" }
+                    return
+                }
+                if let parsedURL = URL(string: rel.html_url) {
+                    self.releaseURL = parsedURL
+                }
+                if self.isNewerVersion(rel.tag_name, than: self.currentVersion) {
+                    self.updateAvailableVersion = rel.tag_name
+                    self.statusText = "Update available: \(rel.tag_name)"
+                } else {
+                    self.updateAvailableVersion = nil
+                    if !silent { self.statusText = "Up to date (v\(self.currentVersion))" }
+                }
+            }
+        }.resume()
+    }
+
+    func openReleasePage() {
+        NSWorkspace.shared.open(releaseURL)
+    }
+}
+
 // MARK: - Shield ViewModel
 
 @MainActor
 final class ShieldViewModel: ObservableObject {
     @Published var isActive: Bool = false
     @Published var isTransitioning: Bool = false
-    @Published var selectedMode: String = "gaming"
-    @Published var lockGatewayARP: Bool = true
-    @Published var customGatewayMAC: String = ""
-    @Published var watchSpoofMAC: String = ""
+    @Published var selectedMode: String = UserDefaults.standard.string(forKey: "shield.selectedMode") ?? "gaming" {
+        didSet { UserDefaults.standard.set(selectedMode, forKey: "shield.selectedMode") }
+    }
+    @Published var lockGatewayARP: Bool = (UserDefaults.standard.object(forKey: "shield.lockGatewayARP") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(lockGatewayARP, forKey: "shield.lockGatewayARP") }
+    }
+    @Published var customGatewayMAC: String = UserDefaults.standard.string(forKey: "shield.customGatewayMAC") ?? "" {
+        didSet { UserDefaults.standard.set(customGatewayMAC, forKey: "shield.customGatewayMAC") }
+    }
+    @Published var watchSpoofMAC: String = UserDefaults.standard.string(forKey: "shield.watchSpoofMAC") ?? "" {
+        didSet { UserDefaults.standard.set(watchSpoofMAC, forKey: "shield.watchSpoofMAC") }
+    }
     @Published var telemetry: ShieldTelemetry?
+    @Published var pingHistory: [Double] = []
     @Published var logs: [String] = []
     @Published var errorMessage: String?
 
@@ -124,8 +304,27 @@ final class ShieldViewModel: ObservableObject {
     var onStatusChange: ((Bool, String) -> Void)?
     var onTelemetryUpdate: ((ShieldTelemetry) -> Void)?
 
+    var pingJitter: Double? {
+        guard pingHistory.count >= 2 else { return nil }
+        var totalDiff = 0.0
+        for i in 1..<pingHistory.count {
+            totalDiff += abs(pingHistory[i] - pingHistory[i - 1])
+        }
+        return totalDiff / Double(pingHistory.count - 1)
+    }
+
+    var pingMin: Double? { pingHistory.min() }
+    var pingAvg: Double? {
+        guard !pingHistory.isEmpty else { return nil }
+        return pingHistory.reduce(0, +) / Double(pingHistory.count)
+    }
+
     init() {
         checkExistingEngine()
+    }
+
+    private func isValidMAC(_ s: String) -> Bool {
+        s.range(of: "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", options: .regularExpression) != nil
     }
 
     private func isProcessAlive(_ pid: Int32) -> Bool {
@@ -167,14 +366,26 @@ final class ShieldViewModel: ObservableObject {
         let escapedHome = home.replacingOccurrences(of: "'", with: "'\\''")
         let escapedUser = user.replacingOccurrences(of: "'", with: "'\\''")
 
-        var extraFlags = " --lock-arp \(lockArg)"
         let cleanGW = customGatewayMAC.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanSpoof = watchSpoofMAC.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanGW.isEmpty && !isValidMAC(cleanGW) {
+            errorMessage = "Invalid Gateway MAC format (expected xx:xx:xx:xx:xx:xx)."
+            isTransitioning = false
+            return
+        }
+        if !cleanSpoof.isEmpty && !isValidMAC(cleanSpoof) {
+            errorMessage = "Invalid Spoofer MAC format (expected xx:xx:xx:xx:xx:xx)."
+            isTransitioning = false
+            return
+        }
+
+        pingHistory.removeAll()
+        var extraFlags = " --lock-arp \(lockArg)"
         if !cleanGW.isEmpty {
-            extraFlags += " --gateway-mac '\(cleanGW.replacingOccurrences(of: "'", with: ""))'"
+            extraFlags += " --gateway-mac '\(cleanGW)'"
         }
         if !cleanSpoof.isEmpty {
-            extraFlags += " --spoof-mac '\(cleanSpoof.replacingOccurrences(of: "'", with: ""))'"
+            extraFlags += " --spoof-mac '\(cleanSpoof)'"
         }
 
         let innerCmd = "'\(escapedScript)' --mode \(mode) --app-pid \(appPid) --stop-file '\(stopFile)' --user '\(escapedUser)' --home '\(escapedHome)'\(extraFlags) </dev/null >/tmp/mac_shield_boot.log 2>&1 &"
@@ -232,6 +443,7 @@ final class ShieldViewModel: ObservableObject {
                 self.pollTimer?.invalidate()
                 self.pollTimer = nil
                 self.shieldStartedAt = nil
+                self.pingHistory.removeAll()
                 self.isActive = false
                 self.isTransitioning = false
                 self.readLogs()
@@ -268,10 +480,15 @@ final class ShieldViewModel: ObservableObject {
             if decoded.restored == true && !decoded.active {
                 isActive = false
                 shieldStartedAt = nil
+                pingHistory.removeAll()
                 pollTimer?.invalidate()
                 pollTimer = nil
                 onStatusChange?(false, selectedMode)
             } else if decoded.active {
+                if let p = decoded.ping_ms {
+                    pingHistory.append(p)
+                    if pingHistory.count > 20 { pingHistory.removeFirst() }
+                }
                 onTelemetryUpdate?(decoded)
             }
         } else if isActive, let startedAt = shieldStartedAt, Date().timeIntervalSince(startedAt) > 12 {
@@ -285,6 +502,7 @@ final class ShieldViewModel: ObservableObject {
             if !pidAlive {
                 isActive = false
                 shieldStartedAt = nil
+                pingHistory.removeAll()
                 pollTimer?.invalidate()
                 pollTimer = nil
                 errorMessage = "Shield engine stopped unexpectedly (see /tmp/mac_shield_boot.log)"
@@ -318,6 +536,9 @@ final class CleanerViewModel: ObservableObject {
     @Published var cleanSummary: CleanSummary?
     @Published var errorMessage: String?
 
+    private var hasLoadedPrefs = false
+    private let prefsKey = "cleaner.catSelection"
+
     @Published var categories: [CleanCategory] = [
         CleanCategory(id: "app_caches", title: "App Caches", subtitle: "~/Library/Caches (open apps safely skipped)", icon: "shippingbox.fill", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
         CleanCategory(id: "containers", title: "Sandboxed Containers & Mail", subtitle: "Containers, Group Containers & Mail Downloads", icon: "square.stack.3d.up.fill", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
@@ -331,14 +552,30 @@ final class CleanerViewModel: ObservableObject {
         CleanCategory(id: "shaders", title: "GPU Shader Caches", subtitle: "d3dm & Metal shader caches (rebuilds on next launch)", icon: "cpu.fill", badge: "Optional", requiresAdmin: false, kb: 0, isSelected: false),
         CleanCategory(id: "trash", title: "Empty Trash", subtitle: "Permanently deletes items in ~/.Trash", icon: "trash.fill", badge: "Optional", requiresAdmin: false, kb: 0, isSelected: false),
         CleanCategory(id: "system_wide", title: "System-Wide Caches & APFS Snapshots", subtitle: "/Library/Caches, DiagnosticReports, /var/log, tmutil snapshots", icon: "lock.shield.fill", badge: "Admin", requiresAdmin: true, kb: 0, isSelected: false)
-    ]
+    ] {
+        didSet { saveCategorySelection() }
+    }
 
     var selectedTotalKB: Int64 {
         categories.filter(\.isSelected).reduce(0) { $0 + $1.kb }
     }
 
     init() {
+        if let saved = UserDefaults.standard.dictionary(forKey: prefsKey) as? [String: Bool] {
+            for i in categories.indices {
+                if let val = saved[categories[i].id] {
+                    categories[i].isSelected = val
+                }
+            }
+        }
+        hasLoadedPrefs = true
         scan()
+    }
+
+    private func saveCategorySelection() {
+        guard hasLoadedPrefs else { return }
+        let dict = Dictionary(uniqueKeysWithValues: categories.map { ($0.id, $0.isSelected) })
+        UserDefaults.standard.set(dict, forKey: prefsKey)
     }
 
     func scan() {
@@ -354,14 +591,18 @@ final class CleanerViewModel: ObservableObject {
             proc.executableURL = URL(fileURLWithPath: "/bin/bash")
             proc.arguments = [scriptPath, "--scan"]
             let outPipe = Pipe()
+            let errPipe = Pipe()
             proc.standardOutput = outPipe
+            proc.standardError = errPipe
 
             do {
                 try proc.run()
                 let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
+                let exitStatus = proc.terminationStatus
 
-                if let decoded = try? JSONDecoder().decode(ScanResponse.self, from: data) {
+                if exitStatus == 0, let decoded = try? JSONDecoder().decode(ScanResponse.self, from: data) {
                     DispatchQueue.main.async {
                         guard let self = self else { return }
                         self.totalKB = decoded.total_kb
@@ -377,9 +618,11 @@ final class CleanerViewModel: ObservableObject {
                         self.statusText = "Scan complete — select items to clean"
                     }
                 } else {
+                    let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     DispatchQueue.main.async {
                         self?.isScanning = false
-                        self?.statusText = "Scan finished"
+                        self?.statusText = "Scan failed"
+                        self?.errorMessage = errStr.isEmpty ? "Storage scan failed (exit code \(exitStatus))." : errStr
                     }
                 }
             } catch {
@@ -432,38 +675,17 @@ final class CleanerViewModel: ObservableObject {
             var skipped: [String] = []
 
             if !userCats.isEmpty {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-                proc.arguments = [scriptPath, "--clean", "--cats", userCats.joined(separator: ",")]
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-
-                pipe.fileHandleForReading.readabilityHandler = { handle in
-                    let chunk = handle.availableData
-                    guard !chunk.isEmpty, let str = String(data: chunk, encoding: .utf8) else { return }
-                    for line in str.split(separator: "\n") {
-                        let s = String(line)
-                        if s.hasPrefix("PROGRESS|") {
-                            let parts = s.split(separator: "|", maxSplits: 2).map(String.init)
-                            if parts.count == 3, let pct = Double(parts[1]) {
-                                DispatchQueue.main.async {
-                                    self?.progress = min(pct / 100.0, needsAdmin ? 0.88 : 0.98)
-                                    self?.statusText = parts[2]
-                                }
-                            }
-                        } else if s.hasPrefix("RESULT|") {
-                            let parts = s.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-                            if parts.count >= 5 {
-                                totalCleanedKB += Int64(parts[3]) ?? 0
-                                skipped = parts[4].split(separator: "|").map(String.init).filter { !$0.hasPrefix("com.apple.") }
-                            }
-                        }
+                let res = runLineStreamingBash(
+                    scriptPath: scriptPath,
+                    arguments: ["--clean", "--cats", userCats.joined(separator: ",")]
+                ) { [weak self] pct, text in
+                    DispatchQueue.main.async {
+                        self?.progress = min(pct / 100.0, needsAdmin ? 0.88 : 0.98)
+                        self?.statusText = text
                     }
                 }
-
-                try? proc.run()
-                proc.waitUntilExit()
-                pipe.fileHandleForReading.readabilityHandler = nil
+                totalCleanedKB += res.cleanedKB
+                skipped = res.skipped
             }
 
             if needsAdmin {
@@ -549,6 +771,9 @@ final class ExternalDrivesViewModel: ObservableObject {
     @Published var cleanSummary: CleanSummary?
     @Published var errorMessage: String?
 
+    private var hasLoadedPrefs = false
+    private let prefsKey = "external.catSelection"
+
     @Published var categories: [CleanCategory] = [
         CleanCategory(id: "ext_trashes", title: "Drive Trash (.Trashes)", subtitle: "Deleted files still occupying space on this external drive", icon: "trash.fill", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
         CleanCategory(id: "ext_temp", title: "Temporary Items (.TemporaryItems)", subtitle: "Interrupted copies & macOS safe temp items on this drive", icon: "clock.arrow.circlepath", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
@@ -556,7 +781,9 @@ final class ExternalDrivesViewModel: ObservableObject {
         CleanCategory(id: "ext_steam_cache", title: "External Steam Download & Depot Cache", subtitle: "SteamLibrary downloading/temp/depotcache (never touches installed games)", icon: "gamecontroller.fill", badge: nil, requiresAdmin: false, kb: 0, isSelected: true),
         CleanCategory(id: "ext_appledouble", title: "macOS ._* AppleDouble & .DS_Store Clutter", subtitle: "Removes 128KB-cluster ExFAT sidecar files & .DS_Store safely", icon: "doc.on.doc.fill", badge: "ExFAT Boost", requiresAdmin: false, kb: 0, isSelected: true),
         CleanCategory(id: "ext_spotlight", title: "Spotlight & FSEvents Logs (.Spotlight-V100)", subtitle: "Clears external Spotlight index cache on this drive", icon: "magnifyingglass", badge: "Optional", requiresAdmin: false, kb: 0, isSelected: false)
-    ]
+    ] {
+        didSet { saveCategorySelection() }
+    }
 
     private var mountObservers: [NSObjectProtocol] = []
 
@@ -569,6 +796,14 @@ final class ExternalDrivesViewModel: ObservableObject {
     }
 
     init() {
+        if let saved = UserDefaults.standard.dictionary(forKey: prefsKey) as? [String: Bool] {
+            for i in categories.indices {
+                if let val = saved[categories[i].id] {
+                    categories[i].isSelected = val
+                }
+            }
+        }
+        hasLoadedPrefs = true
         refreshDrives()
         let nc = NSWorkspace.shared.notificationCenter
         mountObservers.append(nc.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] _ in
@@ -577,6 +812,12 @@ final class ExternalDrivesViewModel: ObservableObject {
         mountObservers.append(nc.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in self?.refreshDrives() }
         })
+    }
+
+    private func saveCategorySelection() {
+        guard hasLoadedPrefs else { return }
+        let dict = Dictionary(uniqueKeysWithValues: categories.map { ($0.id, $0.isSelected) })
+        UserDefaults.standard.set(dict, forKey: prefsKey)
     }
 
     func refreshDrives() {
@@ -631,14 +872,18 @@ final class ExternalDrivesViewModel: ObservableObject {
             proc.executableURL = URL(fileURLWithPath: "/bin/bash")
             proc.arguments = [scriptPath, "--ext-scan", "--vol", mountPath]
             let outPipe = Pipe()
+            let errPipe = Pipe()
             proc.standardOutput = outPipe
+            proc.standardError = errPipe
 
             do {
                 try proc.run()
                 let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
+                let exitStatus = proc.terminationStatus
 
-                if let decoded = try? JSONDecoder().decode(ExternalScanResponse.self, from: data) {
+                if exitStatus == 0, let decoded = try? JSONDecoder().decode(ExternalScanResponse.self, from: data) {
                     DispatchQueue.main.async {
                         guard let self = self else { return }
                         if let idx = self.drives.firstIndex(where: { $0.mountPath == decoded.mount }) {
@@ -653,9 +898,11 @@ final class ExternalDrivesViewModel: ObservableObject {
                         self.statusText = "Scan complete for \(URL(fileURLWithPath: decoded.mount).lastPathComponent)"
                     }
                 } else {
+                    let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     DispatchQueue.main.async {
                         self?.isScanning = false
-                        self?.statusText = "Scan finished"
+                        self?.statusText = "Scan failed"
+                        self?.errorMessage = errStr.isEmpty ? "External drive scan failed (exit code \(exitStatus))." : errStr
                     }
                 }
             } catch {
@@ -683,49 +930,26 @@ final class ExternalDrivesViewModel: ObservableObject {
         let startFreeKB = drive.freeKB
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-            proc.arguments = [scriptPath, "--ext-clean", "--vol", mountPath, "--cats", selectedIDs.joined(separator: ",")]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-
-            var beforeKB = startFreeKB
-            var afterKB = startFreeKB
-            var cleanedKB: Int64 = 0
-
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let chunk = handle.availableData
-                guard !chunk.isEmpty, let str = String(data: chunk, encoding: .utf8) else { return }
-                for line in str.split(separator: "\n") {
-                    let s = String(line)
-                    if s.hasPrefix("PROGRESS|") {
-                        let parts = s.split(separator: "|", maxSplits: 2).map(String.init)
-                        if parts.count == 3, let pct = Double(parts[1]) {
-                            DispatchQueue.main.async {
-                                self?.progress = min(pct / 100.0, 0.98)
-                                self?.statusText = parts[2]
-                            }
-                        }
-                    } else if s.hasPrefix("RESULT|") {
-                        let parts = s.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-                        if parts.count >= 4 {
-                            beforeKB = Int64(parts[1]) ?? startFreeKB
-                            afterKB = Int64(parts[2]) ?? startFreeKB
-                            cleanedKB = Int64(parts[3]) ?? 0
-                        }
-                    }
+            let res = runLineStreamingBash(
+                scriptPath: scriptPath,
+                arguments: ["--ext-clean", "--vol", mountPath, "--cats", selectedIDs.joined(separator: ",")]
+            ) { [weak self] pct, text in
+                DispatchQueue.main.async {
+                    self?.progress = min(pct / 100.0, 0.98)
+                    self?.statusText = text
                 }
             }
-
-            try? proc.run()
-            proc.waitUntilExit()
-            pipe.fileHandleForReading.readabilityHandler = nil
+            let beforeKB = res.beforeKB > 0 ? res.beforeKB : startFreeKB
+            let afterKB = res.afterKB > 0 ? res.afterKB : startFreeKB
 
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.progress = 1.0
                 self.isCleaning = false
-                self.cleanSummary = CleanSummary(beforeKB: beforeKB, afterKB: afterKB, cleanedKB: cleanedKB, skippedApps: [])
+                if !res.stderr.isEmpty && res.cleanedKB == 0 {
+                    self.errorMessage = res.stderr
+                }
+                self.cleanSummary = CleanSummary(beforeKB: beforeKB, afterKB: afterKB, cleanedKB: res.cleanedKB, skippedApps: [])
                 self.statusText = "External drive cleanup finished!"
                 self.scanDrive(mountPath)
             }
@@ -756,6 +980,8 @@ struct MainDashboardView: View {
     @ObservedObject var shieldVM: ShieldViewModel
     @ObservedObject var cleanerVM: CleanerViewModel
     @ObservedObject var externalVM: ExternalDrivesViewModel
+    @ObservedObject var loginManager: LoginItemManager
+    @ObservedObject var updateChecker: UpdateChecker
     @State private var selectedTab: Int = 0
 
     var body: some View {
@@ -774,17 +1000,43 @@ struct MainDashboardView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Mac Shield & Cleaner")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundColor(.white)
-                        Text("Anti-Lag Shield  •  System Data & External Drive Cleaner")
+                        HStack(spacing: 6) {
+                            Text("Mac Shield & Cleaner")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(.white)
+                            Text("v\(updateChecker.currentVersion)")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.6))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.white.opacity(0.08))
+                                .cornerRadius(4)
+                        }
+                        Text(updateChecker.statusText ?? "Anti-Lag Shield  •  System Data & External Drive Cleaner")
                             .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.55))
+                            .foregroundColor(updateChecker.updateAvailableVersion != nil ? .green : .white.opacity(0.55))
                     }
 
                     Spacer()
 
                     HStack(spacing: 8) {
+                        if let newVer = updateChecker.updateAvailableVersion {
+                            Button(action: { updateChecker.openReleasePage() }) {
+                                StatusPill(icon: "arrow.down.circle.fill", text: "Update \(newVer)", color: .green)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            Button(action: { updateChecker.checkForUpdates(silent: false) }) {
+                                StatusPill(
+                                    icon: updateChecker.isChecking ? "arrow.clockwise" : "arrow.triangle.2.circlepath",
+                                    text: updateChecker.isChecking ? "Checking..." : "Check Updates",
+                                    color: .white.opacity(0.75)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(updateChecker.isChecking)
+                        }
+
                         StatusPill(
                             icon: shieldVM.isActive ? "bolt.shield.fill" : "shield",
                             text: shieldVM.isActive ? (shieldVM.selectedMode == "gaming" ? "Shield: Gaming" : "Shield: Streaming") : "Shield: Standby",
@@ -822,7 +1074,7 @@ struct MainDashboardView: View {
                 Divider().background(Theme.cardBorder)
 
                 if selectedTab == 0 {
-                    ShieldTabView(vm: shieldVM)
+                    ShieldTabView(vm: shieldVM, loginManager: loginManager)
                 } else if selectedTab == 1 {
                     CleanerTabView(vm: cleanerVM)
                 } else {
@@ -884,6 +1136,7 @@ struct TabButton: View {
 
 struct ShieldTabView: View {
     @ObservedObject var vm: ShieldViewModel
+    @ObservedObject var loginManager: LoginItemManager
     @State private var showNetworkOptions: Bool = false
 
     var body: some View {
@@ -1021,6 +1274,13 @@ struct ShieldTabView: View {
                     TelemetryCard(
                         title: "Internet Ping (1.1.1.1)",
                         value: t?.ping_ms.map { String(format: "%.1f ms", $0) } ?? "--",
+                        subvalue: {
+                            guard vm.isActive, let avg = vm.pingAvg, let minP = vm.pingMin else { return nil }
+                            if let jit = vm.pingJitter {
+                                return String(format: "±%.1fms jitter • min %.1f / avg %.1f", jit, minP, avg)
+                            }
+                            return String(format: "min %.1f / avg %.1f ms", minP, avg)
+                        }(),
                         icon: "network",
                         color: pingColor(t?.ping_ms, good: 20.0, warn: 50.0)
                     )
@@ -1054,9 +1314,18 @@ struct ShieldTabView: View {
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(.white.opacity(0.75))
                         Spacer()
-                        Text("Auto-restores Spotlight, AWDL & sysctl on Stop/Quit")
-                            .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.45))
+                        Toggle("Launch at Login", isOn: Binding(
+                            get: { loginManager.isEnabled },
+                            set: { loginManager.setEnabled($0) }
+                        ))
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.75))
+                    }
+                    if let loginNote = loginManager.statusMessage {
+                        Text(loginNote)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.yellow.opacity(0.85))
                     }
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 3) {
@@ -1139,6 +1408,7 @@ struct ModeCard: View {
 struct TelemetryCard: View {
     let title: String
     let value: String
+    var subvalue: String? = nil
     let icon: String
     let color: Color
 
@@ -1157,6 +1427,13 @@ struct TelemetryCard: View {
                 .foregroundColor(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
+            if let sub = subvalue {
+                Text(sub)
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.55))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1170,6 +1447,7 @@ struct TelemetryCard: View {
 
 struct CleanerTabView: View {
     @ObservedObject var vm: CleanerViewModel
+    @State private var showTrashConfirm: Bool = false
 
     var body: some View {
         ScrollView {
@@ -1284,13 +1562,26 @@ struct CleanerTabView: View {
                     .cornerRadius(10)
                 }
 
+                if let err = vm.errorMessage {
+                    Text(err)
+                        .font(.system(size: 12))
+                        .foregroundColor(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text("Cache, Temp & System Data Categories")
                             .font(.system(size: 13, weight: .bold))
                             .foregroundColor(.white)
                         Spacer()
-                        Button(action: { vm.cleanSelected() }) {
+                        Button(action: {
+                            if vm.categories.first(where: { $0.id == "trash" })?.isSelected == true {
+                                showTrashConfirm = true
+                            } else {
+                                vm.cleanSelected()
+                            }
+                        }) {
                             HStack(spacing: 8) {
                                 if vm.isCleaning {
                                     ProgressView().controlSize(.small).colorScheme(.dark)
@@ -1309,6 +1600,12 @@ struct CleanerTabView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(vm.isCleaning || vm.isScanning || vm.categories.allSatisfy { !$0.isSelected })
+                        .alert("Empty Trash Permanently?", isPresented: $showTrashConfirm) {
+                            Button("Cancel", role: .cancel) {}
+                            Button("Empty Trash & Clean", role: .destructive) { vm.cleanSelected() }
+                        } message: {
+                            Text("Items in ~/.Trash will be permanently deleted and cannot be recovered.")
+                        }
                     }
 
                     if vm.isCleaning {
@@ -1418,6 +1715,7 @@ struct CleanerTabView: View {
 
 struct ExternalDrivesTabView: View {
     @ObservedObject var vm: ExternalDrivesViewModel
+    @State private var showRootTempConfirm: Bool = false
 
     var body: some View {
         ScrollView {
@@ -1561,6 +1859,13 @@ struct ExternalDrivesTabView: View {
                         .cornerRadius(10)
                     }
 
+                    if let err = vm.errorMessage {
+                        Text(err)
+                            .font(.system(size: 12))
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
                     if let drive = vm.selectedDrive {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
@@ -1573,7 +1878,13 @@ struct ExternalDrivesTabView: View {
                                         .foregroundColor(.white.opacity(0.55))
                                 }
                                 Spacer()
-                                Button(action: { vm.cleanSelectedDrive() }) {
+                                Button(action: {
+                                    if vm.categories.first(where: { $0.id == "ext_root_temp" })?.isSelected == true {
+                                        showRootTempConfirm = true
+                                    } else {
+                                        vm.cleanSelectedDrive()
+                                    }
+                                }) {
                                     HStack(spacing: 8) {
                                         if vm.isCleaning {
                                             ProgressView().controlSize(.small).colorScheme(.dark)
@@ -1592,6 +1903,12 @@ struct ExternalDrivesTabView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .disabled(vm.isCleaning || vm.isScanning || vm.categories.allSatisfy { !$0.isSelected })
+                                .alert("Clean Root Temp/ Folder?", isPresented: $showRootTempConfirm) {
+                                    Button("Cancel", role: .cancel) {}
+                                    Button("Clean Drive", role: .destructive) { vm.cleanSelectedDrive() }
+                                } message: {
+                                    Text("This will delete all contents inside \(drive.mountPath)/Temp along with your other selected categories.")
+                                }
                             }
 
                             if vm.isCleaning {
@@ -1664,8 +1981,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let shieldVM = ShieldViewModel()
     let cleanerVM = CleanerViewModel()
     let externalVM = ExternalDrivesViewModel()
+    let loginManager = LoginItemManager()
+    let updateChecker = UpdateChecker()
     private var lastMenuActive: Bool?
     private var lastMenuMode: String?
+    private var lastMenuLoginEnabled: Bool?
     private var statsMenuItem: NSMenuItem?
     private var vipMenuItem: NSMenuItem?
 
@@ -1683,6 +2003,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         setupMenuBar()
         openMainWindow()
+        updateChecker.checkForUpdates(silent: true)
     }
 
     private func setupMainMenu() {
@@ -1691,6 +2012,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Check for Updates...", action: #selector(menuCheckUpdates), keyEquivalent: ""))
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(NSMenuItem(title: "Quit Mac Shield & Cleaner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
 
@@ -1728,7 +2051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openMainWindow() {
         if window == nil {
-            let rootView = MainDashboardView(shieldVM: shieldVM, cleanerVM: cleanerVM, externalVM: externalVM)
+            let rootView = MainDashboardView(shieldVM: shieldVM, cleanerVM: cleanerVM, externalVM: externalVM, loginManager: loginManager, updateChecker: updateChecker)
             let hosting = NSHostingController(rootView: rootView)
             let win = NSWindow(contentViewController: hosting)
             win.title = "Mac Shield & Cleaner"
@@ -1778,11 +2101,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        guard lastMenuActive != active || lastMenuMode != mode || statusItem?.menu == nil else {
+        guard lastMenuActive != active || lastMenuMode != mode || lastMenuLoginEnabled != loginManager.isEnabled || statusItem?.menu == nil else {
             return
         }
         lastMenuActive = active
         lastMenuMode = mode
+        lastMenuLoginEnabled = loginManager.isEnabled
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Open Mac Shield & Cleaner", action: #selector(openMainWindow), keyEquivalent: "o"))
@@ -1808,8 +2132,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(NSMenuItem(title: "Start Streaming Shield", action: #selector(menuStartStreaming), keyEquivalent: "t"))
         }
         menu.addItem(NSMenuItem.separator())
+        let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(menuToggleLogin), keyEquivalent: "")
+        loginItem.state = loginManager.isEnabled ? .on : .off
+        menu.addItem(loginItem)
+        menu.addItem(NSMenuItem(title: "Check for Updates...", action: #selector(menuCheckUpdates), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
+    }
+
+    @objc private func menuToggleLogin() {
+        loginManager.setEnabled(!loginManager.isEnabled)
+        updateStatusItem(active: shieldVM.isActive, mode: shieldVM.selectedMode, telemetry: shieldVM.telemetry)
+    }
+
+    @objc private func menuCheckUpdates() {
+        updateChecker.checkForUpdates(silent: false)
+        openMainWindow()
     }
 
     @objc private func menuStartGaming() {
